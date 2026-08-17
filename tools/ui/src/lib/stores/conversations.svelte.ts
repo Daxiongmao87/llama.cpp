@@ -29,8 +29,9 @@ import { RouterService } from '$lib/services/router.service';
 // direct imports between stores, not via the barrel, to avoid circular deps
 import { mcpStore } from '$lib/stores/mcp.svelte';
 import { settingsStore } from '$lib/stores/settings.svelte';
+import { tabsStore } from '$lib/stores/tabs.svelte';
 import type { McpServerOverride } from '$lib/types/database';
-import { filterByLeafNodeId, findLeafNode, generateConversationTitle } from '$lib/utils';
+import { filterByLeafNodeId, findLeafNode, generateConversationTitle, uuid } from '$lib/utils';
 import { SvelteSet } from 'svelte/reactivity';
 import { toast } from 'svelte-sonner';
 
@@ -45,6 +46,13 @@ class ConversationsStore {
 
 	/** List of all conversations */
 	conversations = $state<DatabaseConversation[]>([]);
+
+	/**
+	 * Unsaved new-chat tabs. Each carries a temporary id used directly as the
+	 * route (`#/chat/<id>`); it is persisted to the database - and moved to
+	 * `conversations` - only when the first message is sent.
+	 */
+	temporaryConversations = $state<DatabaseConversation[]>([]);
 
 	/** Currently active conversation */
 	activeConversation = $state<DatabaseConversation | null>(null);
@@ -229,6 +237,79 @@ class ConversationsStore {
 		return conversation.id;
 	}
 
+	/** True if the id refers to an unsaved new-chat tab */
+	isTemporaryConversation(id: string): boolean {
+		return this.temporaryConversations.some((c) => c.id === id);
+	}
+
+	/** Update an unsaved new-chat tab in place (not persisted to the DB) */
+	private updateTemporaryConversation(id: string, updates: Partial<DatabaseConversation>): void {
+		this.temporaryConversations = this.temporaryConversations.map((c) =>
+			c.id === id ? { ...c, ...updates } : c
+		);
+	}
+
+	/** Build an unsaved new-chat conversation, baking in the pending cwd/effort */
+	private createTemporaryConversation(): DatabaseConversation {
+		const conversation: DatabaseConversation = {
+			currNode: '',
+			cwd: this.pendingCwd ?? undefined,
+			id: uuid(),
+			lastModified: Date.now(),
+			name: 'New chat',
+			reasoningEffort: this.pendingReasoningEffort
+		};
+
+		this.pendingCwd = null;
+		this.temporaryConversations = [...this.temporaryConversations, conversation];
+
+		return conversation;
+	}
+
+	/**
+	 * Open a fresh new-chat tab (an unsaved conversation) and navigate to it.
+	 * Used by the "New chat" actions (sidebar, keyboard, tab bar, search) and
+	 * prompt/model deep-links.
+	 */
+	async openNewChatTab(): Promise<string> {
+		const conversation = this.createTemporaryConversation();
+
+		await goto(RouterService.chat(conversation.id));
+
+		return conversation.id;
+	}
+
+	/**
+	 * Persist an unsaved new-chat tab to the database, keeping its id so the
+	 * route and tab stay stable. Called on the first message of a new chat.
+	 * @param convId - The temporary conversation id to persist
+	 */
+	async persistTemporaryConversation(convId: string): Promise<void> {
+		const temp = this.temporaryConversations.find((c) => c.id === convId);
+
+		if (!temp) return;
+
+		// clone out of the $state proxy so IndexedDB serializes plain data
+		const conversation = { ...temp };
+
+		await DatabaseService.createConversationWithId(conversation);
+
+		this.temporaryConversations = this.temporaryConversations.filter((c) => c.id !== convId);
+		this.conversations = [conversation, ...this.conversations];
+		this.activeConversation = conversation;
+	}
+
+	/**
+	 * Persist the active conversation if it is an unsaved new-chat tab.
+	 */
+	async ensureActiveConversationPersisted(): Promise<void> {
+		const active = this.activeConversation;
+
+		if (active && this.isTemporaryConversation(active.id)) {
+			await this.persistTemporaryConversation(active.id);
+		}
+	}
+
 	/**
 	 * Loads a specific conversation and its messages
 	 * @param convId - The conversation ID to load
@@ -236,6 +317,17 @@ class ConversationsStore {
 	 */
 	async loadConversation(convId: string): Promise<boolean> {
 		try {
+			// unsaved new-chat tab: present in memory only
+			const temp = this.temporaryConversations.find((c) => c.id === convId);
+
+			if (temp) {
+				this.pendingCwd = null;
+				this.activeConversation = temp;
+				this.activeMessages = [];
+
+				return true;
+			}
+
 			const conversation = await DatabaseService.getConversation(convId);
 
 			if (!conversation) {
@@ -287,6 +379,20 @@ class ConversationsStore {
 	 * @param convId - The conversation ID to delete
 	 */
 	async deleteConversation(convId: string, options?: { deleteWithForks?: boolean }): Promise<void> {
+		// an unsaved new-chat tab is not in the DB; just drop it and close its tab
+		if (this.isTemporaryConversation(convId)) {
+			this.temporaryConversations = this.temporaryConversations.filter((c) => c.id !== convId);
+
+			if (this.activeConversation?.id === convId) {
+				this.clearActiveConversation();
+				await tabsStore.close(convId, convId);
+			} else {
+				tabsStore.removeTabs([convId]);
+			}
+
+			return;
+		}
+
 		try {
 			await DatabaseService.deleteConversation(convId, options);
 
@@ -308,8 +414,13 @@ class ConversationsStore {
 				this.conversations = this.conversations.filter((c) => !idsToRemove.has(c.id));
 
 				if (this.activeConversation && idsToRemove.has(this.activeConversation.id)) {
+					const activeId = this.activeConversation.id;
+
+					tabsStore.removeTabs([...idsToRemove].filter((id) => id !== activeId));
 					this.clearActiveConversation();
-					await goto(ROUTES.NEW_CHAT);
+					await tabsStore.close(activeId, activeId);
+				} else {
+					tabsStore.removeTabs([...idsToRemove]);
 				}
 			} else {
 				// Reparent direct children to deleted conv's parent (or promote to top-level)
@@ -326,7 +437,9 @@ class ConversationsStore {
 
 				if (this.activeConversation?.id === convId) {
 					this.clearActiveConversation();
-					await goto(ROUTES.NEW_CHAT);
+					await tabsStore.close(convId, convId);
+				} else {
+					tabsStore.removeTabs([convId]);
 				}
 			}
 		} catch (error) {
@@ -345,10 +458,12 @@ class ConversationsStore {
 
 			this.clearActiveConversation();
 			this.conversations = [];
+			this.temporaryConversations = [];
+			tabsStore.clear();
 
 			toast.success('All conversations deleted');
 
-			await goto(ROUTES.NEW_CHAT);
+			await goto(ROUTES.START);
 		} catch (error) {
 			console.error('Failed to delete all conversations:', error);
 			toast.error('Failed to delete conversations');
@@ -389,8 +504,13 @@ class ConversationsStore {
 			this.conversations = this.conversations.filter((c) => !idsToRemove.has(c.id));
 
 			if (activeWasDeleted) {
+				const activeId = this.activeConversation!.id;
+
+				tabsStore.removeTabs([...idsToRemove].filter((id) => id !== activeId));
 				this.clearActiveConversation();
-				await goto(ROUTES.NEW_CHAT);
+				await tabsStore.close(activeId, activeId);
+			} else {
+				tabsStore.removeTabs([...idsToRemove]);
 			}
 
 			toast.success(
@@ -770,20 +890,29 @@ class ConversationsStore {
 			}
 		}
 
-		await DatabaseService.updateConversation(this.activeConversation.id, {
-			mcpServerOverrides: newOverrides.length > 0 ? newOverrides : undefined
-		});
+		const id = this.activeConversation.id;
+		const overrides = newOverrides.length > 0 ? newOverrides : undefined;
 
 		this.activeConversation = {
 			...this.activeConversation,
-			mcpServerOverrides: newOverrides.length > 0 ? newOverrides : undefined
+			mcpServerOverrides: overrides
 		};
 
-		const convIndex = this.conversations.findIndex((c) => c.id === this.activeConversation!.id);
+		// unsaved new-chat tab: keep the override in memory until it is persisted
+		if (this.isTemporaryConversation(id)) {
+			this.updateTemporaryConversation(id, { mcpServerOverrides: overrides });
+
+			return;
+		}
+
+		await DatabaseService.updateConversation(id, {
+			mcpServerOverrides: overrides
+		});
+
+		const convIndex = this.conversations.findIndex((c) => c.id === id);
 
 		if (convIndex !== -1) {
-			this.conversations[convIndex].mcpServerOverrides =
-				newOverrides.length > 0 ? newOverrides : undefined;
+			this.conversations[convIndex].mcpServerOverrides = overrides;
 		}
 	}
 
@@ -839,16 +968,25 @@ class ConversationsStore {
 			return;
 		}
 
+		const id = this.activeConversation.id;
+
 		this.activeConversation = {
 			...this.activeConversation,
 			reasoningEffort: effort
 		};
 
-		await DatabaseService.updateConversation(this.activeConversation.id, {
+		// unsaved new-chat tab: keep the effort in memory until it is persisted
+		if (this.isTemporaryConversation(id)) {
+			this.updateTemporaryConversation(id, { reasoningEffort: effort });
+
+			return;
+		}
+
+		await DatabaseService.updateConversation(id, {
 			reasoningEffort: effort
 		});
 
-		const convIndex = this.conversations.findIndex((c) => c.id === this.activeConversation!.id);
+		const convIndex = this.conversations.findIndex((c) => c.id === id);
 
 		if (convIndex !== -1) {
 			this.conversations[convIndex].reasoningEffort = effort;
@@ -875,16 +1013,26 @@ class ConversationsStore {
 			return;
 		}
 
+		const id = this.activeConversation.id;
+
 		this.activeConversation = {
 			...this.activeConversation,
 			cwd: trimmed
 		};
 
-		await DatabaseService.updateConversation(this.activeConversation.id, {
+		// unsaved new-chat tab: keep the pick in memory until it is persisted
+		if (this.isTemporaryConversation(id)) {
+			this.updateTemporaryConversation(id, { cwd: trimmed });
+			this.pendingCwd = null;
+
+			return;
+		}
+
+		await DatabaseService.updateConversation(id, {
 			cwd: trimmed
 		});
 
-		const convIndex = this.conversations.findIndex((c) => c.id === this.activeConversation!.id);
+		const convIndex = this.conversations.findIndex((c) => c.id === id);
 
 		if (convIndex !== -1) {
 			this.conversations[convIndex].cwd = trimmed;

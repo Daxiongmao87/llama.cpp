@@ -564,6 +564,8 @@ class ChatStore {
 		if (!activeConv) {
 			await conversationsStore.createConversation();
 			activeConv = conversationsStore.activeConversation;
+		} else if (conversationsStore.isTemporaryConversation(activeConv.id)) {
+			await conversationsStore.persistTemporaryConversation(activeConv.id);
 		}
 
 		if (!activeConv) return;
@@ -727,6 +729,9 @@ class ChatStore {
 
 		if (!activeConv) {
 			await conversationsStore.createConversation();
+			isNewConversation = true;
+		} else if (conversationsStore.isTemporaryConversation(activeConv.id)) {
+			await conversationsStore.persistTemporaryConversation(activeConv.id);
 			isNewConversation = true;
 		}
 

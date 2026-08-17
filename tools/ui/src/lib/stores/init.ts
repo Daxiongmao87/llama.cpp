@@ -11,6 +11,7 @@
 import { conversationsStore } from './conversations.svelte';
 import { permissionsStore } from './permissions.svelte';
 import { settingsStore } from './settings.svelte';
+import { tabsStore } from './tabs.svelte';
 import { toolsStore } from './tools.svelte';
 import { versionStore } from './version.svelte';
 import { browser } from '$app/environment';
@@ -31,4 +32,7 @@ export async function initStores(): Promise<void> {
 	void versionStore.initialize();
 
 	await conversationsStore.init();
+
+	// prune persisted tabs against the loaded conversation list
+	tabsStore.init(conversationsStore.conversations.map((c) => c.id));
 }

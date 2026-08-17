@@ -73,6 +73,9 @@ export function useReasoningMenu(): UseReasoningMenuReturn {
 		get isOff() {
 			return currentEffort === ReasoningEffort.OFF;
 		},
+		get isReasoningActive() {
+			return isReasoningActive;
+		},
 		isSelected(level: ReasoningEffortLevel): boolean {
 			return currentEffort === level.value;
 		},
@@ -87,9 +90,6 @@ export function useReasoningMenu(): UseReasoningMenuReturn {
 		},
 		get thinkingEnabled() {
 			return thinkingEnabled;
-		},
-		get isReasoningActive() {
-			return isReasoningActive;
 		},
 		tokenLabel(level: ReasoningEffortLevel): string | null {
 			if (level.value === ReasoningEffort.DEFAULT) return 'Model default';

@@ -104,7 +104,7 @@
 		if (targetIdx >= 0 && targetIdx < allConvs.length) {
 			goto(RouterService.chat(allConvs[targetIdx].id));
 		} else {
-			goto(ROUTES.NEW_CHAT);
+			conversationsStore.openNewChatTab();
 		}
 	}
 

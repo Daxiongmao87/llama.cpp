@@ -44,19 +44,19 @@ def one(i):
                 if ttf is None:
                     ttf = time.time() - t0
                 toks += 1
-    t1 = time.time()
+    t1 = time.time() - t0  # relative, like ttf
     if not toks:
         return (i, 0.0, ttf)
     tps = (toks - 1) / max(1e-9, t1 - ttf)  # first token is "free" (prompt logits)
-    return (i, tps, ttf)
+    return (i, tps, ttf, toks)
 
 t_start = time.time()
 with concurrent.futures.ThreadPoolExecutor(N_PAR) as ex:
     res = list(ex.map(one, range(N_PAR)))
 wall = time.time() - t_start
-ok = [(i, t) for i, t, _ in res if t > 0]
-for i, tps, ttf in sorted(res, key=lambda x: x[0]):
-    print(f"  stream {i}: {tps:6.1f} t/s   (TTFT {ttf:.2f}s, {MAXTOK} tok)" if tps else f"  stream {i}: FAIL (ttf={ttf})")
+ok = [(i, t) for i, t, _, _ in res if t > 0]
+for i, tps, ttf, toks in sorted(res, key=lambda x: x[0]):
+    print(f"  stream {i}: {tps:6.1f} t/s   (TTFT {ttf:.2f}s, {toks} tok)" if tps else f"  stream {i}: FAIL (ttf={ttf}, toks={toks})")
 if ok:
     vals = [t for _, t in ok]
     agg = sum(v for v in vals)

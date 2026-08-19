@@ -556,6 +556,8 @@ struct common_params {
     bool multiline_input   = false; // reverse the usage of `\`
     bool simple_io         = false; // improves compatibility with subprocesses and limited consoles
     bool cont_batching     = true;  // insert new sequences for decoding on-the-fly
+    bool cont_batch_split  = false; // server: split the prompt batch evenly across slots with pending prompts ( Volta: fixes staggered-prefill starvation)
+    bool slot_sim_use_cache = false; // server: on LCP-similar slot selection with partial overlap, still consult the prompt cache (Volta: fixes cross-convo misassignment -> full re-prefill)
     bool no_perf           = false; // disable performance metrics
     bool show_timings      = true;  // show timing information on CLI
     bool ctx_shift         = false; // context shift on infinite text generation

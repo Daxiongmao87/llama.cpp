@@ -38,6 +38,7 @@
 #include "ggml-cuda/out-prod.cuh"
 #include "ggml-cuda/pad.cuh"
 #include "ggml-cuda/pool2d.cuh"
+#include "ggml-cuda/qpn-volta.cuh"
 #include "ggml-cuda/quantize.cuh"
 #include "ggml-cuda/rope.cuh"
 #include "ggml-cuda/roll.cuh"
@@ -73,6 +74,7 @@
 #include <array>
 #include <atomic>
 #include <charconv>
+#include <chrono>
 #include <cinttypes>
 #include <condition_variable>
 #include <cstddef>
@@ -738,6 +740,8 @@ struct ggml_backend_cuda_buffer_context {
 
 static void ggml_backend_cuda_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
+    // the Volta QPN prepack is cached per weight pointer, so it must not outlive the buffer
+    ggml_cuda_qpn_free_cache_range(ctx->dev_ptr, buffer->size);
     delete ctx;
 }
 
@@ -1623,6 +1627,29 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
     } else if (compute_type == GGML_TYPE_F16 && !fast_fp16_hardware_available(ggml_cuda_info().devices[ctx.device].cc)) {
         compute_type = GGML_TYPE_F32;
     }
+
+    // NVIDIA GPUs before sm_80 have no BF16 tensor cores: cuBLAS dispatches
+    // BF16 GEMMs there to embedded MAGMA CUDA-core kernels (~14 TFLOPS on
+    // V100). FP16 tensor cores exist on sm_70 (~8x faster), and the weight
+    // conversion BF16->FP16 happens once per call inside cublas_impl.
+    if (compute_type == GGML_TYPE_BF16) {
+        const int cc_bf = ggml_cuda_info().devices[ctx.device].cc;
+        if (GGML_CUDA_CC_IS_NVIDIA(cc_bf) && cc_bf < 800) {
+            compute_type = GGML_TYPE_F16;
+        }
+    }
+
+    // TEMP routing probe
+    if (getenv("GGML_CUDA_VOLTA_QPN_TRACE") && src0->ne[1] >= 512) {
+        static std::map<int,int> seen;
+        if (++seen[(int)src0->type] <= 3) {
+            fprintf(stderr, "CUBLAS-ROUTE: src0_type=%s(%d) compute=%s(%d) fp16_hw_avail=%d K=%ld N=%ld M=%ld\n",
+                    ggml_type_name(src0->type), (int)src0->type,
+                    ggml_type_name(compute_type), (int)compute_type,
+                    (int)fast_fp16_hardware_available(ggml_cuda_info().devices[ctx.device].cc),
+                    (long)src0->ne[0], (long)src0->ne[1], (long)src1->ne[1]);
+        }
+    }
     if (dst->op_params[0] == GGML_PREC_F32) {
         compute_type = GGML_TYPE_F32;
     }
@@ -1850,19 +1877,57 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_vec_f(ctx, src1, src0, nullptr, &dst_vec);
         return;
     }
+    if (ggml_cuda_should_use_qpn_volta(src0, src1, dst, cc, ctx.stream())) {
+        ggml_cuda_mul_mat_qpn_volta(ctx, src0, src1, dst);
+        return;
+    }
+    // TEMP: why do NVFP4 muls skip the QPN path? GGML_CUDA_VOLTA_QPN_TRACE=1
+    if (src0->type == GGML_TYPE_NVFP4 && getenv("GGML_CUDA_VOLTA_QPN_TRACE")) {
+        static int qpn_skip_log = 0;
+        if (qpn_skip_log++ < 25) {
+            fprintf(stderr, "QPN-SKIP: K=%ld N=%ld M=%ld ne11=%ld cont=%d%d%d ne2=%ld/%ld ne3=%ld/%ld cc=%d\n",
+                    (long) src0->ne[0], (long) src0->ne[1], (long) src1->ne[1], (long) ne11,
+                    (int) ggml_is_contiguous(src0), (int) ggml_is_contiguous(src1), (int) ggml_is_contiguous(dst),
+                    (long) src0->ne[2], (long) src1->ne[2], (long) src0->ne[3], (long) src1->ne[3], cc);
+        }
+    }
+    // TEMP stock-path timing for NVFP4, GGML_CUDA_VOLTA_QPN_TIMING=1: sample
+    // every 37th call, sync-bracketed, aggregated per shape and flushed at exit
+    static const bool st_timing = getenv("GGML_CUDA_VOLTA_QPN_TIMING") != nullptr;
+    static long st_n = 0;
+    struct qpn_stock_time_acc {
+        std::unordered_map<uint64_t, std::pair<double, long>> per_shape;
+        ~qpn_stock_time_acc() {
+            for (const auto & e : per_shape) {
+                const int k = (int) (e.first >> 40), n = (int) ((e.first >> 20) & 0xFFFFF), m = (int) (e.first & 0xFFFFF);
+                fprintf(stderr, "QPN-STOCK-TIME: K=%d N=%d M=%d calls=%ld us_per_call=%.2f\n",
+                        k, n, m, e.second.second, e.second.first / e.second.second);
+            }
+        }
+    };
+    static qpn_stock_time_acc st_times;
+    const uint64_t st_key = ((uint64_t) src0->ne[0] << 40) | ((uint64_t) src0->ne[1] << 20) | (uint64_t) src1->ne[1];
+    const bool st_sample = st_timing && src0->type == GGML_TYPE_NVFP4 && (st_n++ % 37) == 0;
+    const auto st_now = [] { return std::chrono::steady_clock::now(); };
+    const auto st_t0 = st_sample ? cudaStreamSynchronize(ctx.stream()), st_now() : st_now();
+
     if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
+        if (st_sample) { CUDA_CHECK(cudaStreamSynchronize(ctx.stream())); st_times.per_shape[st_key].first += std::chrono::duration<double, std::micro>(st_now() - st_t0).count(), st_times.per_shape[st_key].second++; }
         return;
     }
     if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
+        if (st_sample) { CUDA_CHECK(cudaStreamSynchronize(ctx.stream())); st_times.per_shape[st_key].first += std::chrono::duration<double, std::micro>(st_now() - st_t0).count(), st_times.per_shape[st_key].second++; }
         return;
     }
     if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
+        if (st_sample) { CUDA_CHECK(cudaStreamSynchronize(ctx.stream())); st_times.per_shape[st_key].first += std::chrono::duration<double, std::micro>(st_now() - st_t0).count(), st_times.per_shape[st_key].second++; }
         return;
     }
     ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
+    if (st_sample) { CUDA_CHECK(cudaStreamSynchronize(ctx.stream())); st_times.per_shape[st_key].first += std::chrono::duration<double, std::micro>(st_now() - st_t0).count(), st_times.per_shape[st_key].second++; }
 }
 
 // returns true when ggml_cuda_mul_mat_id takes the fallback path that requires stream synchronization
@@ -2541,6 +2606,10 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
     bool use_cuda_graph = true;
+    // TEMP QPN diagnostics: sampled stream-sync timing needs eager execution
+    if (getenv("GGML_CUDA_VOLTA_QPN_TIMING")) {
+        return false;
+    }
     // Loop over nodes in GGML graph to obtain info needed for CUDA graph
 
     for (int i = 0; i < cgraph->n_nodes; i++) {

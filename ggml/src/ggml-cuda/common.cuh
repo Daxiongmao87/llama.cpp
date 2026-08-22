@@ -362,6 +362,17 @@ static bool blackwell_mma_available(const int cc) {
            ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_RUBIN;
 }
 
+static inline bool ggml_cuda_volta_qpn_enabled() {
+    const char * env = getenv("GGML_CUDA_VOLTA_QPN");
+    if (!env) return false;
+    return env[0] == '1' || env[0] == 't' || env[0] == 'T' || env[0] == 'y' || env[0] == 'Y';
+}
+
+static bool volta_qpn_available(const int cc) {
+    return GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_VOLTA &&
+           ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA && ggml_cuda_volta_qpn_enabled();
+}
+
 // Checks whether the tensor's base data pointer and higher-dimensional strides are byte-aligned to `alignment` bytes.
 static bool ggml_cuda_is_aligned(const ggml_tensor * tensor, const size_t alignment) {
     GGML_ASSERT(tensor != nullptr);

@@ -13,6 +13,7 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <chrono>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -971,6 +972,14 @@ float * llama_context::get_embeddings_nextn_ith(int32_t i) {
     }
 }
 
+ggml_tensor * llama_context::get_h_nextn_tensor() {
+    llm_graph_result * res = get_gf_res_reserve();
+    if (!res) {
+        return nullptr;
+    }
+    return res->get_h_nextn();
+}
+
 float * llama_context::get_embeddings_layer_inp(uint32_t lid) {
     output_reorder();
 
@@ -1323,11 +1332,33 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    // TEMP phase timing (GGML_CUDA_VOLTA_QPN_TRACE): bucket draft (n_tokens==1)
+    // vs verify (n_tokens>1) decodes; cumulative print every 32 calls
+    static const bool pt_on = getenv("GGML_CUDA_VOLTA_QPN_TRACE") != nullptr;
+    struct ub_phase_acc {
+        double apply = 0, set_in = 0, compute = 0, total = 0;
+        long n1 = 0, n8 = 0;
+        double t1 = 0, t8 = 0;
+        ~ub_phase_acc() {
+            fprintf(stderr, "UB-PHASE: draft(n=1) steps=%ld avg_total=%.2f ms | verify(n>1) steps=%ld avg_total=%.2f ms | apply=%.1f set_inputs=%.1f graph_compute=%.1f ms totals\n",
+                    n1, n1 ? t1/n1 : 0.0, n8, n8 ? t8/n8 : 0.0, apply, set_in, compute);
+        }
+    };
+    static ub_phase_acc ub_acc;
+    static long ub_calls = 0;
+    const bool pt_bucket1 = (ubatch.n_tokens == 1);
+    const auto pt_now = []{ return std::chrono::steady_clock::now(); };
+    const bool pt = pt_on;
+    const auto pt_t0 = pt ? pt_now() : pt_now();
+
+    double pt_apply = 0, pt_setin = 0;
+
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
+    const auto pt_a1 = pt ? pt_now() : pt_now();
 
     auto * res = gf_res_prev.get();
     auto * gf  = res->get_gf();
@@ -1374,19 +1405,28 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     // set the input data for the input tensors
     {
-        //const auto t_start_us = ggml_time_us();
-
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
+        const auto pt_s0 = pt ? pt_now() : pt_now();
         res->set_inputs(&ubatch);
-
-        //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+        if (pt) { pt_setin = std::chrono::duration<double, std::milli>(pt_now() - pt_s0).count(); }
     }
 
+    const auto pt_c0 = pt ? pt_now() : pt_now();
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
+    }
+    const auto pt_c1 = pt ? pt_now() : pt_now();
+    if (pt) { pt_apply = std::chrono::duration<double, std::milli>(pt_a1 - pt_t0).count(); pt_setin += 0; }
+
+    if (pt) {
+        ++ub_calls;
+        const double tot = std::chrono::duration<double, std::milli>(pt_c1 - pt_t0).count();
+        fprintf(stderr, "UB-PHASE: call=%ld n_tok=%d total=%.2f apply=%.2f set_inputs=%.2f graph_compute=%.2f\n",
+                ub_calls, (int) ubatch.n_tokens, tot, pt_apply, pt_setin,
+                std::chrono::duration<double, std::milli>(pt_c1 - pt_c0).count());
     }
 
     ret = GGML_STATUS_SUCCESS;
@@ -3792,6 +3832,10 @@ llama_memory_t llama_get_memory(const struct llama_context * ctx) {
     }
 
     return ctx->get_memory();
+}
+
+ggml_tensor * llama_get_h_nextn_tensor(llama_context * ctx) {
+    return ctx->get_h_nextn_tensor();
 }
 
 float * llama_get_embeddings_nextn(llama_context * ctx) {

@@ -88,6 +88,11 @@ struct llama_context {
     float * get_embeddings_nextn();
     float * get_embeddings_nextn_ith(int32_t i);
 
+    // device-resident hidden state feeding the nextn head (t_h_nextn from the
+    // reserved graph result); enables zero-copy consumption by a custom draft
+    // graph. returns nullptr when no graph result is reserved.
+    ggml_tensor * get_h_nextn_tensor();
+
     float * get_embeddings_layer_inp(uint32_t lid);
 
     llama_token * get_sampled_tokens() const;

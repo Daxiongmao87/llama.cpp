@@ -14,6 +14,7 @@
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
+#include <chrono>
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
@@ -3614,12 +3615,26 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        // TEMP phase split (GGML_CUDA_VOLTA_QPN_TRACE): enqueue vs synchronize
+        static const bool pt_dec = getenv("GGML_CUDA_VOLTA_QPN_TRACE") != nullptr;
+        double pt_deq_ms = 0, pt_sync_ms = 0;
         queue_tasks.yield_to_queue([&]() {
+            const auto d0 = pt_dec ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             ret = llama_decode(ctx_tgt, batch_view);
+            const auto d1 = pt_dec ? std::chrono::steady_clock::now() : d0;
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
+            if (pt_dec) {
+                const auto d2 = std::chrono::steady_clock::now();
+                pt_deq_ms  = std::chrono::duration<double, std::milli>(d1 - d0).count();
+                pt_sync_ms = std::chrono::duration<double, std::milli>(d2 - d1).count();
+            }
         });
+        if (pt_dec && has_output) {
+            fprintf(stderr, "TGT-DECODE: n_tok=%d enqueue=%.2f ms synchronize=%.2f ms\n",
+                    (int) batch_view.n_tokens, pt_deq_ms, pt_sync_ms);
+        }
 
         if (ret != 0) {
             {

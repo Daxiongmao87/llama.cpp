@@ -1,6 +1,7 @@
 #include "speculative.h"
 
 #include "common.h"
+#include <chrono>
 #include "ggml.h"
 #include "ggml-cpp.h"
 #include "llama.h"
@@ -304,6 +305,11 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
         }
 
         int i = 0;
+
+        // TEMP draft-loop phase timing (GGML_CUDA_VOLTA_QPN_TRACE)
+        static const bool dt = getenv("GGML_CUDA_VOLTA_QPN_TRACE") != nullptr;
+        double t_decode_ms = 0, t_sample_ms = 0, t_batch_ms = 0;
+        int    t_steps = 0;
 
         while (n_drafting > 0) {
             int i_batch = 0;
@@ -764,6 +770,11 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         }
 
         int i = 0;
+
+        // TEMP draft-loop phase timing (GGML_CUDA_VOLTA_QPN_TRACE)
+        static const bool dt = getenv("GGML_CUDA_VOLTA_QPN_TRACE") != nullptr;
+        double t_decode_ms = 0, t_sample_ms = 0, t_batch_ms = 0;
+        int    t_steps = 0;
 
         while (n_drafting > 0) {
             int i_batch = 0;
@@ -1583,6 +1594,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         int i = 0;
 
+        // TEMP draft-loop phase timing (GGML_CUDA_VOLTA_QPN_TRACE)
+        static const bool dt = getenv("GGML_CUDA_VOLTA_QPN_TRACE") != nullptr;
+        double t_decode_ms = 0, t_sample_ms = 0, t_batch_ms = 0;
+        int    t_steps = 0;
+
         while (n_drafting > 0) {
             // each step decodes under a different head, i.e. a different decoder layer, and
             // KV is per layer. process() filled this layer's KV only for positions < n_past
@@ -1600,11 +1616,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 llama_set_nextn_layer_offset(ctx_dft, i);
             }
 
+            const auto td0 = dt ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             int ret = llama_decode(ctx_dft, batch);
             if (ret != 0) {
                 SPC_ERR("llama_decode[%d] returned %d\n", i, ret);
                 break;
             }
+            const auto td1 = dt ? std::chrono::steady_clock::now() : td0;
+            if (dt) { t_decode_ms += std::chrono::duration<double, std::milli>(td1 - td0).count(); }
 
             // rebuild the batch for the next step: the growing-KV paths re-add only the
             // new token (the KV already holds the prefix), while chained heads re-add the
@@ -1618,22 +1637,32 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 auto * smpl = smpls[seq_id].get();
 
-                common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
+                const auto ts0 = dt ? std::chrono::steady_clock::now() : td1;
+                const llama_token id = common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
                 const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
+                const auto ts1 = dt ? std::chrono::steady_clock::now() : td1;
+                if (dt) { t_sample_ms += std::chrono::duration<double, std::milli>(ts1 - ts0).count(); }
 
-                const auto * cur_p = common_sampler_get_candidates(smpl, true);
+                // p_min == 0 disables the confidence gate entirely: with backend
+                // sampling the greedy token comes from the device and skipping
+                // candidate extraction keeps the whole draft loop off the host
+                float p_top = 1.0f;
+                const llama_token_data_array * cur_p = nullptr;
+                if (params.p_min > 0.0f) {
+                    cur_p = common_sampler_get_candidates(smpl, true);
+                    if (cur_p->size > 0) {
+                        p_top = cur_p->data[cur_p->selected].p;
+                    }
+                }
 
-                for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
+                for (int k = 0; cur_p && k < std::min(3, (int) cur_p->size); ++k) {
                     SPC_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
                             seq_id, k, i, cur_p->data[k].id, cur_p->data[k].p,
                             common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
                 }
 
-                // add drafted token for each sequence
-                const llama_token id = cur_p->data[0].id;
-
                 // only collect very high-confidence draft tokens
-                if (cur_p->data[0].p < params.p_min) {
+                if (p_top < params.p_min) {
                     drafting[seq_id] = false;
                     n_drafting--;
 
@@ -1677,6 +1706,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 i_last[seq_id] = batch.n_tokens - 1;
             }
 
+            if (dt) {
+                t_batch_ms += 0;   // rebuilt below inside loop body; measured via total residual
+                t_steps++;
+            }
+
             if (batch.n_tokens == 0) {
                 break;
             }
@@ -1686,6 +1720,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         if (chain_heads) {
             llama_set_nextn_layer_offset(ctx_dft, 0); // restore default for non-draft decodes
+        }
+
+        if (dt && t_steps > 0) {
+            fprintf(stderr, "DRAFT-PHASE: steps=%d decode_ms=%.2f sample_ms=%.2f (per draft: decode=%.2f sample=%.2f)\n",
+                    t_steps, t_decode_ms, t_sample_ms, t_decode_ms/t_steps, t_sample_ms/t_steps);
         }
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {

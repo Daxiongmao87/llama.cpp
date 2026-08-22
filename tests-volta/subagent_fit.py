@@ -29,13 +29,18 @@ def main():
     # each <task-result> block, deduped (delivery messages repeat)
     seen, results = set(), []
     for m in re.finditer(
-        r'<task-result id="(\w+)" agent="task" status="(\w+)" duration="([\dms]+)">.*?<output>\s*(\{[^}]*\})\s*</output>',
+        r'<task-result id="(\w+)" agent="task" status="(\w+)" duration="([\dms]+)">.*?<output>\s*(.*?)\s*</output>',
         full, re.S):
         if m.group(1) in seen:
             continue
         seen.add(m.group(1))
-        wc = re.search(r'word_count["\']?\s*:\s*(\d+)', m.group(4))
-        results.append((m.group(1), m.group(2), m.group(3), int(wc.group(1)) if wc else None))
+        out = m.group(4).strip()
+        wc = re.search(r'word_count["\']?\s*:\s*(\d+)', out)
+        if wc:
+            words = int(wc.group(1))
+        else:
+            words = len(out.split()) if len(out) > 50 else 0
+        results.append((m.group(1), m.group(2), m.group(3), words))
     ok_lines = len(re.findall(r"SUB\s+\d+:\s*OK", full))
     ts = None
     for line in open(path):

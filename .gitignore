@@ -24,6 +24,7 @@
 
 # IDE / OS
 
+/.agents/
 /.cache/
 /.ccls-cache/
 /.direnv/

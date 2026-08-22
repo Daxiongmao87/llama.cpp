@@ -2581,6 +2581,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SLOT_SIM_USE_CACHE"));
     add_opt(common_arg(
+        {"--volta-qpn"},
+        {"--no-volta-qpn"},
+        "enable Volta QPN NVFP4/MXFP4 path on SM70 (opt-in, env GGML_CUDA_VOLTA_QPN=1, default off)",
+        [](common_params & params, bool value) {
+            (void) params;
+            setenv("GGML_CUDA_VOLTA_QPN", value ? "1" : "0", 1);
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMMON}));
+    add_opt(common_arg(
         {"-mm", "--mmproj"}, "FILE",
         "path to a multimodal projector file. see tools/mtmd/README.md\n"
         "note: if -hf is used, this argument can be omitted",
